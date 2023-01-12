@@ -39,6 +39,7 @@
 #include "tensorflow/lite/kernels/internal/tensor_ctypes.h"
 #include "tensorflow/lite/kernels/internal/types.h"
 #include "tim/transform/layout_inference.h"
+#include "tim/fuse/batch_fuse.h"
 
 using namespace tflite;
 namespace {
@@ -638,19 +639,26 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     TFLITE_LOG(TFLITE_LOG_INFO, "Verifying graph");
     // Do layout inference and get a new graph(first) and a tensor map(second).
     layout_infered_ = tim::transform::LayoutInference(graph_, context_);
+    uint32_t fake_batch = 4;
+    batch_fuse_ =
+        tim::fuse::BatchFuse(layout_infered_.first, context_, fake_batch);
+    auto produce_graph = batch_fuse_.first;
+    auto produce_io_map = batch_fuse_.second;
+
 #ifdef MULTI_DEVICE_FEATURE_MODE
       executor_ = std::make_shared<tim::vx::platform::NativeExecutor>(devices_[device_id_]);
-      executable_ = tim::vx::platform::Compile(layout_infered_.first, executor_);
+      executable_ = tim::vx::platform::Compile(produce_graph, executor_);
+      compiled_ = true;
 #else
     if(is_cache_present_ && !is_cache_present_.value()){
       nbg_size_ = -1;
-      compiled_ = layout_infered_.first->CompileToBinary(nullptr, &nbg_size_);
+      compiled_ = produce_graph->CompileToBinary(nullptr, &nbg_size_);
       if (!compiled_) {
         TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "compile to binary failed");
         return kTfLiteDelegateError;
         }
         std::vector<uint8_t> nbg_buf(nbg_size_);
-        compiled_ = layout_infered_.first->CompileToBinary(nbg_buf.data(), &nbg_size_);
+        compiled_ = produce_graph->CompileToBinary(nbg_buf.data(), &nbg_size_);
         if (!compiled_) {
           TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "compile to binary failed");
           return kTfLiteDelegateError;
@@ -658,7 +666,7 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
         fs_.write(reinterpret_cast<const char*>(nbg_buf.data()),nbg_size_);
         fs_.close();
     } else {
-      compiled_ = layout_infered_.first->Compile();
+      compiled_ = produce_graph->Compile();
       if (!compiled_) {
         TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "Failed to verify graph");
         return kTfLiteDelegateError;
@@ -681,9 +689,19 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     const void* tensor_data =
         reinterpret_cast<const void*>(tf_tensor.data.raw_const);
     // TODO(derekjchow): Check result
-    auto infered_input_tensor = layout_infered_.second[src_input_tensor];
+    // auto infered_input_tensor = layout_infered_.second[src_input_tensor];
+    auto infered_input_tensor =
+        batch_fuse_.second[layout_infered_.second[src_input_tensor]];
     if (infered_input_tensor) {
-      infered_input_tensor->CopyDataToTensor(const_cast<void*>(tensor_data));
+      // infered_input_tensor->CopyDataToTensor(const_cast<void*>(tensor_data));
+      auto infered_shape = infered_input_tensor->GetShape();
+
+      std::vector<uint8_t> input_data(infered_shape[0] * infered_shape[1] *
+                                          infered_shape[2] * infered_shape[3],
+                                      2);
+      infered_input_tensor->CopyDataToTensor(
+          input_data.data(), input_data.size() * sizeof(uint8_t));
+      std::cout << "input_data.size() " << input_data.size() << std::endl;
     } else {
       TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
                       "tensor in source graph removed before do layout "
@@ -692,9 +710,14 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
 #ifdef MULTI_DEVICE_FEATURE_MODE
     uint32_t tensor_index = 0;
     auto input_spec = infered_input_tensor->GetSpec();
+    auto infered_shape = infered_input_tensor->GetShape();
+
+    std::vector<uint8_t> input_data(infered_shape[0] * infered_shape[1] *
+                                        infered_shape[2] * infered_shape[3],
+                                    2);
     inputs_.push_back(executable_->AllocateTensor(input_spec));
     executable_->SetInput(inputs_[tensor_index]);
-    inputs_[tensor_index]->CopyDataToTensor(tensor_data,
+    inputs_[tensor_index]->CopyDataToTensor(input_data.data(),
                                             input_spec.GetByteSize());
 #endif
   }
@@ -704,9 +727,10 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
   for (int tensor_idx : op_data.subgraph_outputs) {
     TfLiteTensor& tf_tensor = context->tensors[tensor_idx];
     auto src_output_tensor = tensors_[tensor_idx];
-
+    auto infered_output_tensor =
+          batch_fuse_.second[layout_infered_.second[src_output_tensor]];
     outputs_.push_back(
-        executable_->AllocateTensor(src_output_tensor->GetSpec()));
+        executable_->AllocateTensor(infered_output_tensor->GetSpec()));
     executable_->SetOutput(outputs_[tensor_index]);
   }
 #endif
@@ -718,7 +742,7 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     executor_->Trigger();
     tensor_index = 0;
 #else
-    if (!layout_infered_.first->Run()) {
+    if (!batch_fuse_.first->Run()) {
       TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "Failed to run graph");
       return kTfLiteDelegateError;
     }
@@ -728,9 +752,16 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     TfLiteTensor& tf_tensor = context->tensors[tensor_idx];
     TFLITE_LOG(
         TFLITE_LOG_INFO, "Copying output %d, %s", tensor_idx, tf_tensor.name);
+    auto src_output_tensor = tensors_[tensor_idx];
 #ifdef MULTI_DEVICE_FEATURE_MODE
       void* tensor_data = reinterpret_cast<void*>(tf_tensor.data.raw);
-      outputs_[tensor_index]->CopyDataFromTensor(tensor_data);
+      // outputs_[tensor_index]->CopyDataFromTensor(tensor_data);
+      auto infered_output_tensor =
+          batch_fuse_.second[layout_infered_.second[src_output_tensor]];
+      std::vector<uint8_t> out_data;
+      auto infered_output_shape = infered_output_tensor->GetShape();
+      out_data.resize(infered_output_shape[0] * infered_output_shape[1]);
+      outputs_[tensor_index]->CopyDataFromTensor(out_data.data());
 #else
       auto src_output_tensor = tensors_[tensor_idx];
       if (!src_output_tensor.get()) {
@@ -739,9 +770,15 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
       }
 
       void* tensor_data = reinterpret_cast<void*>(tf_tensor.data.raw);
-      auto infered_output_tesnor = layout_infered_.second[src_output_tensor];
+      auto infered_output_tensor =
+        batch_fuse_.second[layout_infered_.second[src_output_tensor]];
+      // auto infered_output_tesnor = layout_infered_.second[src_output_tensor];
       if (infered_output_tesnor) {
-        infered_output_tesnor->CopyDataFromTensor(tensor_data);
+        // infered_output_tesnor->CopyDataFromTensor(tensor_data);
+      std::vector<uint8_t> out_data;
+      auto infered_output_shape = infered_output_tensor->GetShape();
+      out_data.resize(infered_output_shape[0] * infered_output_shape[1]);
+      infered_output_tensor->CopyDataFromTensor(out_data.data());
       } else {
         TFLITE_LOG(TFLITE_LOG_ERROR,
                    "Output tensor missing: report issue to VSI");
@@ -760,8 +797,14 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     }
 
     void* tensor_data = reinterpret_cast<void*>(tf_tensor.data.raw);
-    auto infered_state_tensor = layout_infered_.second[src_state_tensor];
-    infered_state_tensor->CopyDataFromTensor(tensor_data);
+    auto infered_state_tensor =
+        batch_fuse_.second[layout_infered_.second[src_state_tensor]];
+    std::vector<uint8_t> out_state;
+    auto infered_out_state_shape = infered_state_tensor->GetShape();
+    out_state.resize(infered_out_state_shape[0] * infered_out_state_shape[1]);
+    infered_state_tensor->CopyDataFromTensor(out_state.data());
+    // auto infered_state_tensor = layout_infered_.second[src_state_tensor];
+    // infered_state_tensor->CopyDataFromTensor(tensor_data);
   }
 
   return kTfLiteOk;

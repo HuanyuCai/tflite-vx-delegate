@@ -144,6 +144,10 @@ class Delegate {
   std::pair<std::shared_ptr<tim::vx::Graph>,
           std::map<std::shared_ptr<tim::vx::Tensor>,
                    std::shared_ptr<tim::vx::Tensor>>> layout_infered_;
+  std::pair<std::shared_ptr<tim::vx::Graph>,
+            std::map<std::shared_ptr<tim::vx::Tensor>,
+                     std::shared_ptr<tim::vx::Tensor>>> batch_fuse_;    
+                                  
   std::map<int32_t, std::shared_ptr<tim::vx::Tensor>> tensors_;
   int32_t placeholder_tensor_idx_{-2};
   std::map<int32_t, std::shared_ptr<tim::vx::Tensor>> state_tensors_;
