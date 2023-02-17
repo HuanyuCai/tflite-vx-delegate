@@ -430,8 +430,8 @@ std::unique_ptr<vx::delegate::OpData> Delegate::Init(
     device_id_ = derivedDelegate->device_id;
 #endif
 
-  compiled_ = false;
-
+  compiled_batch_fuse_ = false;
+  compiled_layout_infered_ = false;
   std::unique_ptr<vx::delegate::OpData> op_data(new OpData());
   // Get the list of input and output tensors. This isn't for a single op, it's
   // for a subgraph.
@@ -529,7 +529,7 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
                               TfLiteContext* context,
                               TfLiteNode* node) {
   TFLITE_LOG(TFLITE_LOG_INFO, "Delegate::Invoke node: %p", node->user_data);
-  if (!compiled_) {
+  if (!compiled_batch_fuse_) {
     // TODO(bo): Handling multi-thread use case
     context_ = tim::vx::Context::Create();
     graph_ = context_->CreateGraph();
@@ -642,32 +642,37 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     uint32_t fake_batch = 4;
     batch_fuse_ =
         tim::fuse::BatchFuse(layout_infered_.first, context_, fake_batch);
-    auto produce_graph = batch_fuse_.first;
-    auto produce_io_map = batch_fuse_.second;
+    auto batch_fuse_graph = batch_fuse_.first;
+    auto batch_fuse_map = batch_fuse_.second;
+    auto layout_infered_graph = layout_infered_.first;
+    auto layout_infered_map = layout_infered_.second;
 
 #ifdef MULTI_DEVICE_FEATURE_MODE
       executor_ = std::make_shared<tim::vx::platform::NativeExecutor>(devices_[device_id_]);
-      executable_ = tim::vx::platform::Compile(produce_graph, executor_);
-      compiled_ = true;
+      executable_ = tim::vx::platform::Compile(batch_fuse_graph_, executor_);
+      compiled_batch_fuse_ = true;
+      executable_layout_infered_ = tim::vx::platform::Compile(
+        layout_infered_graph, executor_);
+    compiled_layout_infered_ = true;
 #else
     if(is_cache_present_ && !is_cache_present_.value()){
       nbg_size_ = -1;
-      compiled_ = produce_graph->CompileToBinary(nullptr, &nbg_size_);
-      if (!compiled_) {
+      compiled_ = batch_fuse_graph->CompileToBinary(nullptr, &nbg_size_);
+      if (!compiled_batch_fuse_) {
         TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "compile to binary failed");
         return kTfLiteDelegateError;
         }
         std::vector<uint8_t> nbg_buf(nbg_size_);
-        compiled_ = produce_graph->CompileToBinary(nbg_buf.data(), &nbg_size_);
-        if (!compiled_) {
+        compiled_batch_fuse_ = batch_fuse_graph->CompileToBinary(nbg_buf.data(), &nbg_size_);
+        if (!compiled_batch_fuse_) {
           TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "compile to binary failed");
           return kTfLiteDelegateError;
         }
         fs_.write(reinterpret_cast<const char*>(nbg_buf.data()),nbg_size_);
         fs_.close();
     } else {
-      compiled_ = produce_graph->Compile();
-      if (!compiled_) {
+      compiled_batch_fuse_ = batch_fuse_graph->Compile();
+      if (!compiled_batch_fuse_) {
         TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "Failed to verify graph");
         return kTfLiteDelegateError;
       }
@@ -689,36 +694,54 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     const void* tensor_data =
         reinterpret_cast<const void*>(tf_tensor.data.raw_const);
     // TODO(derekjchow): Check result
-    // auto infered_input_tensor = layout_infered_.second[src_input_tensor];
-    auto infered_input_tensor =
+    auto fuse_input_tensor =
         batch_fuse_.second[layout_infered_.second[src_input_tensor]];
-    if (infered_input_tensor) {
-      // infered_input_tensor->CopyDataToTensor(const_cast<void*>(tensor_data));
-      auto infered_shape = infered_input_tensor->GetShape();
-
-      std::vector<uint8_t> input_data(infered_shape[0] * infered_shape[1] *
-                                          infered_shape[2] * infered_shape[3],
-                                      2);
-      infered_input_tensor->CopyDataToTensor(
-          input_data.data(), input_data.size() * sizeof(uint8_t));
-      std::cout << "input_data.size() " << input_data.size() << std::endl;
+    auto infer_input_tensor = layout_infered_.second[src_input_tensor];
+        
+    if (fuse_input_tensor) {
+      auto fuse_shape = fuse_input_tensor->GetShape();
+      uint32_t input_size = 1;
+      for (int i = 0; i < fuse_shape.size(); i++) {
+        input_size *= fuse_shape[i];
+      }
+      std::vector<uint8_t> input_data(input_size, 2);
+      fuse_input_tensor->CopyDataToTensor(input_data.data(),
+                                          input_data.size() * sizeof(uint8_t));
+      std::cout << "input data size of batch fuse graph is "
+                << input_data.size() << std::endl;
     } else {
       TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
-                      "tensor in source graph removed before do layout "
-                      "inference - if zero sized tensor involved");
+                      "tensor in source graph removed before do batch "
+                      "fuse - if zero sized tensor involved");
     }
 #ifdef MULTI_DEVICE_FEATURE_MODE
     uint32_t tensor_index = 0;
-    auto input_spec = infered_input_tensor->GetSpec();
-    auto infered_shape = infered_input_tensor->GetShape();
+    auto infer_spec = infer_input_tensor->GetSpec();
+    auto infer_shape = infer_input_tensor->GetShape();
 
-    std::vector<uint8_t> input_data(infered_shape[0] * infered_shape[1] *
-                                        infered_shape[2] * infered_shape[3],
-                                    2);
-    inputs_.push_back(executable_->AllocateTensor(input_spec));
+    auto fuse_spec = fuse_input_tensor->GetSpec();
+    auto fuse_shape = fuse_input_tensor->GetShape();
+
+    uint32_t infer_input_size = 1;
+    uint32_t fuse_input_size = 1;
+    for (int i = 0; i < fuse_shape.size(); i++) {
+      infer_input_size *= infer_shape[i];
+      fuse_input_size *= fuse_shape[i];
+    }
+    std::vector<uint8_t> infer_input_data(infer_input_size, 2);
+    std::vector<uint8_t> fuse_input_data(fuse_input_size, 2);
+
+    inputs_.push_back(executable_->AllocateTensor(fuse_spec));
     executable_->SetInput(inputs_[tensor_index]);
-    inputs_[tensor_index]->CopyDataToTensor(input_data.data(),
-                                            input_spec.GetByteSize());
+    inputs_[tensor_index]->CopyDataToTensor(fuse_input_data.data(),
+                                            fuse_spec.GetByteSize());
+    TFLITE_LOG(TFLITE_LOG_INFO, "Set input data to tensor in batch fuse graph succeed");
+    inputs_layout_infered_.push_back(
+        executable_layout_infered_->AllocateTensor(infer_spec));
+    executable_layout_infered_->SetInput(inputs_layout_infered_[tensor_index]);
+    inputs_layout_infered_[tensor_index]->CopyDataToTensor(
+        infer_input_data.data(), infer_spec.GetByteSize());
+    TFLITE_LOG(TFLITE_LOG_INFO, "Set input data to tensor in layout inference graph succeed");
 #endif
   }
 
@@ -727,17 +750,25 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
   for (int tensor_idx : op_data.subgraph_outputs) {
     TfLiteTensor& tf_tensor = context->tensors[tensor_idx];
     auto src_output_tensor = tensors_[tensor_idx];
-    auto infered_output_tensor =
+    auto fuse_output_tensor =
           batch_fuse_.second[layout_infered_.second[src_output_tensor]];
+    auto infer_output_tensor = layout_infered_.second[src_output_tensor];
     outputs_.push_back(
-        executable_->AllocateTensor(infered_output_tensor->GetSpec()));
+        executable_->AllocateTensor(fuse_output_tensor->GetSpec()));
     executable_->SetOutput(outputs_[tensor_index]);
+    TFLITE_LOG(TFLITE_LOG_INFO, "Set output tensor in batch fuse graph succeed");
+    outputs_layout_infered_.push_back(
+        executable_layout_infered_->AllocateTensor(
+            infer_output_tensor->GetSpec()));
+    executable_layout_infered_->SetOutput(
+        outputs_layout_infered_[tensor_index]);
+    TFLITE_LOG(TFLITE_LOG_INFO, "Set output tensor in layout inference graph succeed");
   }
 #endif
 
   TFLITE_LOG(TFLITE_LOG_INFO, "Invoking graph");
 #ifdef MULTI_DEVICE_FEATURE_MODE
-    auto executable_set = tim::vx::platform::CreateExecutableSet({executable_, executable_});
+    auto executable_set = tim::vx::platform::CreateExecutableSet({executable_, executable_layout_infered_});
     executor_->Submit(executable_set,executable_set);
     executor_->Trigger();
     tensor_index = 0;
@@ -754,31 +785,92 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
         TFLITE_LOG_INFO, "Copying output %d, %s", tensor_idx, tf_tensor.name);
     auto src_output_tensor = tensors_[tensor_idx];
 #ifdef MULTI_DEVICE_FEATURE_MODE
-      void* tensor_data = reinterpret_cast<void*>(tf_tensor.data.raw);
-      // outputs_[tensor_index]->CopyDataFromTensor(tensor_data);
-      auto infered_output_tensor =
+      if (src_output_tensor.get()) {
+      TFLITE_LOG(TFLITE_LOG_INFO,
+                 "Copying output %d, %s in multi device",
+                 tensor_idx,
+                 tf_tensor.name);
+      auto fuse_output_tensor =
           batch_fuse_.second[layout_infered_.second[src_output_tensor]];
-      std::vector<uint8_t> out_data;
-      auto infered_output_shape = infered_output_tensor->GetShape();
-      out_data.resize(infered_output_shape[0] * infered_output_shape[1]);
-      outputs_[tensor_index]->CopyDataFromTensor(out_data.data());
+      auto infer_output_tensor = layout_infered_.second[src_output_tensor];
+      std::vector<uint8_t> fuse_out_data;
+      std::vector<uint8_t> infer_out_data;
+      uint32_t fuse_out_size = 1;
+      uint32_t infer_out_size = 1;
+      auto fuse_output_shape = fuse_output_tensor->GetShape();
+      auto infer_output_shape = infer_output_tensor->GetShape();
+      for (int i = 0; i < fuse_output_shape.size(); i++) {
+        fuse_out_size *= fuse_output_shape[i];
+        infer_out_size *= infer_output_shape[i];
+      }
+      fuse_out_data.resize(fuse_out_size);
+      infer_out_data.resize(infer_out_size);
+      void* tensor_data = reinterpret_cast<void*>(tf_tensor.data.raw);
+      outputs_[tensor_index]->CopyDataFromTensor(fuse_out_data.data());
+      outputs_layout_infered_[tensor_index]->CopyDataFromTensor(
+          infer_out_data.data());
+
+      for (int i = 0; i < infer_out_size; i ++){
+        if (fuse_out_data[i] != infer_out_data[i]){
+          std::cout << "[Output Mismatch] [" << i << "] first batch of batch fuse VS layout inference ("
+          << static_cast<int>(fuse_out_data[i]) << "," << static_cast<int>(infer_out_data[i]) << ")" << std::endl;
+        }
+      }
+      for (int i = 0; i < infer_out_size; i ++){
+        if (fuse_out_data[i+1000] != infer_out_data[i]){
+          std::cout << "[Output Mismatch] [" << i << "] second batch of batch fuse VS layout inference ("
+          << static_cast<int>(fuse_out_data[i+1000]) << "," << static_cast<int>(infer_out_data[i]) << ")" << std::endl;
+        }
+      }
+      for (int i = 0; i < infer_out_size; i ++){
+        if (fuse_out_data[i+2000] != infer_out_data[i]){
+          std::cout << "[Output Mismatch] [" << i << "] third batch of batch fuse VS layout inference ("
+          << static_cast<int>(fuse_out_data[i+2000]) << "," << static_cast<int>(infer_out_data[i]) << ")" << std::endl;
+        }
+      }
+      for (int i = 0; i < infer_out_size; i ++){
+        if (fuse_out_data[i+3000] != infer_out_data[i]){
+          std::cout << "[Output Mismatch] [" << i << "] fourth batch of batch fuse VS layout inference ("
+          << static_cast<int>(fuse_out_data[i+3000]) << "," << static_cast<int>(infer_out_data[i]) << ")" << std::endl;
+        }
+      }
+      TFLITE_LOG(TFLITE_LOG_INFO, "Output tensor of batch fuse graph is : \n");
+      for (int i = 0; i < fuse_out_data.size(); ++i) {
+        std::cout << "[" << i << "] " << static_cast<int>(fuse_out_data[i]) << std::endl;
+      }
+      std::cout<<"================="<<std::endl;
+      
+      TFLITE_LOG(TFLITE_LOG_INFO,
+                 "Output tensor of layout inference graph is : \n");
+      for (int i = 0; i < infer_out_data.size(); ++i) {
+        std::cout << "[" << i << "] " << static_cast<int>(infer_out_data[i]) << std::endl;
+      }
+      std::cout<<"================="<<std::endl;
+    }
 #else
-      auto src_output_tensor = tensors_[tensor_idx];
+      // auto src_output_tensor = tensors_[tensor_idx];
       if (!src_output_tensor.get()) {
         TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "Failed to copy output tensor!");
         return kTfLiteDelegateError;
       }
 
       void* tensor_data = reinterpret_cast<void*>(tf_tensor.data.raw);
-      auto infered_output_tensor =
+      auto fuse_output_tensor =
         batch_fuse_.second[layout_infered_.second[src_output_tensor]];
-      // auto infered_output_tesnor = layout_infered_.second[src_output_tensor];
-      if (infered_output_tesnor) {
-        // infered_output_tesnor->CopyDataFromTensor(tensor_data);
+      if (fuse_output_tensor) {
       std::vector<uint8_t> out_data;
-      auto infered_output_shape = infered_output_tensor->GetShape();
-      out_data.resize(infered_output_shape[0] * infered_output_shape[1]);
-      infered_output_tensor->CopyDataFromTensor(out_data.data());
+      uint32_t fuse_out_size = 1;
+      auto fuse_output_shape = fuse_output_tensor->GetShape();
+      for (int i = 0; i < fuse_output_shape.size(); i++) {
+        fuse_out_size *= fuse_output_shape[i];
+      }
+      out_data.resize(fuse_out_size);
+      fuse_output_tensor->CopyDataFromTensor(out_data.data());
+      TFLITE_LOG(TFLITE_LOG_INFO, "Output tensor of batch fuse graph is : \n");
+      for (int i = 0; i < out_data.size(); ++i) {
+        std::cout << "[" << i << "] " << static_cast<int>(out_data[i]) << std::endl;
+      }
+      std::cout<<"================="<<std::endl;
       } else {
         TFLITE_LOG(TFLITE_LOG_ERROR,
                    "Output tensor missing: report issue to VSI");
@@ -799,12 +891,32 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     void* tensor_data = reinterpret_cast<void*>(tf_tensor.data.raw);
     auto infered_state_tensor =
         batch_fuse_.second[layout_infered_.second[src_state_tensor]];
-    std::vector<uint8_t> out_state;
-    auto infered_out_state_shape = infered_state_tensor->GetShape();
-    out_state.resize(infered_out_state_shape[0] * infered_out_state_shape[1]);
-    infered_state_tensor->CopyDataFromTensor(out_state.data());
-    // auto infered_state_tensor = layout_infered_.second[src_state_tensor];
-    // infered_state_tensor->CopyDataFromTensor(tensor_data);
+    auto fuse_state_tensor =
+        batch_fuse_.second[layout_infered_.second[src_state_tensor]];
+    // auto infer_state_tensor = layout_infered_.second[src_state_tensor];
+
+    std::vector<uint8_t> fuse_out_state;
+    // std::vector<uint8_t> infer_out_state;
+    uint32_t fuse_out_size = 1;
+    // uint32_t infer_out_size = 1;
+    auto fuse_out_state_shape = fuse_state_tensor->GetShape();
+    // auto infer_out_state_shape = infer_state_tensor->GetShape();
+    for (int i = 0; i < fuse_out_state_shape.size(); i++) {
+      fuse_out_size *= fuse_out_state_shape[i];
+      // infer_out_size *= infer_out_state_shape[i];
+    }
+    fuse_out_state.resize(fuse_out_size);
+    // infer_out_state.resize(infer_out_size);
+    fuse_state_tensor->CopyDataFromTensor(fuse_out_state.data());
+    // infer_state_tensor->CopyDataFromTensor(infer_out_state.data());
+
+    for (int i = 0; i < fuse_out_state.size(); ++i) {
+      std::cout << fuse_out_state[i] << " ";
+    }
+    // for (int i = 0; i < infer_out_state.size(); ++i) {
+    //   std::cout << infer_out_state[i] << " ";
+    // }
+    std::cout << std::endl;
   }
 
   return kTfLiteOk;
