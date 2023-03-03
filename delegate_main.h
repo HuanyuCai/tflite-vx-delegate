@@ -154,7 +154,8 @@ class Delegate {
   std::vector<std::shared_ptr<tim::vx::Operation>> ops_;
   std::vector<OperationDataType> operations_;
   struct OperationDataType op_info_;
-  bool compiled_;
+  bool compiled_layout_infered_;
+  bool compiled_batch_fuse_;
 
   absl::optional<bool> is_cache_present_;
   uint32_t device_id_;
