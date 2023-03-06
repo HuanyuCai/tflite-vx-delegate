@@ -657,7 +657,7 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
 #else
     if(is_cache_present_ && !is_cache_present_.value()){
       nbg_size_ = -1;
-      compiled_ = batch_fuse_graph->CompileToBinary(nullptr, &nbg_size_);
+      compiled_batch_fuse_ = batch_fuse_graph->CompileToBinary(nullptr, &nbg_size_);
       if (!compiled_batch_fuse_) {
         TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "compile to binary failed");
         return kTfLiteDelegateError;
