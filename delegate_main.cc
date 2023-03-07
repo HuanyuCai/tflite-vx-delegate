@@ -867,10 +867,10 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
       out_data.resize(fuse_out_size);
       fuse_output_tensor->CopyDataFromTensor(out_data.data());
       TFLITE_LOG(TFLITE_LOG_INFO, "Output tensor of batch fuse graph is : \n");
-      for (int i = 0; i < out_data.size(); ++i) {
-        std::cout << "[" << i << "] " << static_cast<int>(out_data[i]) << std::endl;
-      }
-      std::cout<<"================="<<std::endl;
+      // for (int i = 0; i < out_data.size(); ++i) {
+      //   std::cout << "[" << i << "] " << static_cast<int>(out_data[i]) << std::endl;
+      // }
+      // std::cout<<"================="<<std::endl;
       } else {
         TFLITE_LOG(TFLITE_LOG_ERROR,
                    "Output tensor missing: report issue to VSI");
